@@ -1392,6 +1392,11 @@ You can define your own singleton global actors
 using the `@globalActor` attribute,
 as described in <doc:Attributes#globalActor>.
 
+Another way remove main actor isolation is to use the `@concurrent` attribute.
+A function marked as `@concurrent` runs on the background executor.
+You can apply this to a function in a type
+that otherwise uses `@MainActor` isolation,
+or even to a function within a custom actor.
 
 <!--
   OUTLINE
@@ -1593,13 +1598,35 @@ as discussed in <doc:Protocols#Implicit-Conformance-to-a-Protocol>.
 
 ## Isolated Protocol Conformances
 
-Protocols that are nonisolated
-can be used from anywhere in a concurrent program.
-A conformance to a nonisolated protocol can be isolated
-to a global actor, which allows the implementation to
+As seen earlier, protocols can be isolated to a specific actor.
+If a protocol isn't isolated, it can be used anywhere in a concurrent program. 
+This could make it difficult for an isolated type to conform to a nonisolated
+protocol.
+For example, Swift's `Equatable` type is nonisolated,
+which means that a type that's isolated to a global actor can't conform to the
+protocol.
+Consider this example:
+
+```swift
+@MainActor
+class Person {
+    var id: Int?
+}
+
+extension Person: Equatable {
+    // Incorrect because Person's main-actor-isolated static function '==' can't
+    // satisfy Equatable being nonisolated.
+    static func == (lhs: Person, rhs: Person) -> Bool {
+        return lhs.id == rhs.id
+    }
+}
+```
+
+To allow for isolated types to conform to nonisolated protcols,
+you can isolate the conformance itself to a global actor.
+This is called an *isolated conformance*, and allows the implementation to
 access actor isolated state synchronously.
-This is called an *isolated conformance*.
-When a conformance is isolated,
+When a protocol conformance is isolated,
 Swift prevents data races by ensuring that
 the conformance is only used on the actor
 that the conformance is isolated to.
@@ -1609,17 +1636,17 @@ that the conformance is isolated to.
 You declare an isolated conformance
 by writing the global actor attribute before the protocol name
 when you implement the conformance.
-The following code example declares
-a main-actor isolated conformance to `Equatable` in an extension:
+To correct the previous example, you'd add `@MainActor` to the declaration
+that extends `Person` to add a conformance to `Equatable`, like this:
 
 ```swift
 @MainActor
 class Person {
-    var id: Int
+    var id: Int?
 }
 
 extension Person: @MainActor Equatable {
-    static func ==(lhs: Person, rhs: Person) -> Bool {
+    static func == (lhs: Person, rhs: Person) -> Bool {
         return lhs.id == rhs.id
     }
 }
@@ -1630,15 +1657,9 @@ to use global actor isolated state
 while ensuring that state is only accessed
 from within the actor.
 
-### Inferring an Isolated Conformance
+### Using Inferred Isolated Conformance
 
-> Note:
-> Isolated conformance inference is an upcoming language feature.
-> To enable it in current language modes of Swift,
-> use the feature identifier `InferIsolatedConformances`.
-
-Isolated conformances are inferred
-for global actor isolated types.
+The Swift compiler infers isolated conformances for global-actor-isolated types.
 The following code example declares a conformance to `Equatable`
 for a main-actor isolated class,
 and Swift infers main-actor isolation for the conformance:
@@ -1646,55 +1667,55 @@ and Swift infers main-actor isolation for the conformance:
 ```swift
 @MainActor
 class Person {
-    var id: Int
+    var id: Int?
 }
 
 // Inferred to be a @MainActor conformance to Equatable
 extension Person: Equatable {
-    static func ==(lhs: Person, rhs: Person) -> Bool {
+    static func == (lhs: Person, rhs: Person) -> Bool {
         return lhs.id == rhs.id
     }
 }
 ```
 
+Notice that this is the same as the original example
+at the beginning of the section.
+It doesn't produce a warning
+because the compiler infers the isolated conformance and adds it for you.
+
 You can opt out of this inference for a global-actor-isolated type
-by explicitly declaring that a protocol conformance is nonisolated.
+by explicitly declaring that a protocol conformance is `nonisolated`.
 The following code example declares
 a nonisolated conformance to `Equatable` in an extension:
 
 ```swift
 @MainActor
 class Person {
-    let id: Int
+    let id: Int?
 }
 
 extension Person: nonisolated Equatable {
-    nonisolated static func ==(lhs: Person, rhs: Person) -> Bool {
+    nonisolated static func == (lhs: Person, rhs: Person) -> Bool {
         return lhs.id == rhs.id
     }
 }
 ```
+
+In this example, the compiler produces a warning: "Conformance of `Person`
+to protocol `Equatable` crosses into main actor-isolated code
+and can cause data races; this is an error in the Swift 6 language mode."
+In other words, adding `nonisolated` undoes the actor-isolation
+that the isolated protocol conformance was meant to provide in order to
+fix the original problem.
 
 ### Data-Race Safety for Isolated Conformances
 
 Swift prevents data races for isolated conformances
 by ensuring that protocol requirements are only used
 on the global actor that the conformance is isolated to.
-In generic code,
-where the concrete conforming type is abstracted away,
+In generic code, where the concrete conforming type is abstracted away,
 protocol requirements can be used through type parameters or `any` types.
 
-#### Using Isolated Conformances
-
-A conformance requirement to `Sendable`
-allows generic code to send parameter values to concurrently-executing code.
-If generic code accepts non-`Sendable` types,
-then the generic code can only use the input values
-from the current isolation domain.
-These generic APIs can safely accept isolated conformances
-and call protocol requirements
-as long as the caller is on the same global actor
-that the conformance is isolated to.
 The following code has a protocol `Dancer`,
 a class `Ballerina` with a main-actor isolated conformance to `Dancer`,
 and calls to the `Dancer.perform` requirement
@@ -1720,34 +1741,46 @@ Task { @MainActor in
 }
 
 Task { @concurrent in
-    let ballerina = Ballerina()
-    startRecital(c)  // Error
+    let ballerina = await Ballerina()
+    startRecital(ballerina)  // Error
 
     let dancer: any Dancer = ballerina // Error
     dancer.perform()
 }
 ```
 
-Calling `Dancer.perform` in generic code and on an `any Dancer` type
+Both uses of `Ballerina` from the `Task` ---
+the call to `startRecital(_:)`
+and the attempt to use the main-actor isolated `Ballerina` instance
+as the nonisolated `Dancer` type --
+result in the same warning:
+"Warning: Main actor-isolated conformance of `Ballerina` to `Dancer`
+cannot be used in `@concurrent` context".
+This is because the `@concurrent` attribute implies `nonisolated(nonsending)`,
+which always runs on the caller's executor,
+and therefore isn't compatible with the isolation imposed by `@MainActor`.
+
+Calling `Dancer.perform()` in generic code and on an `any Dancer` type
 from a main actor task
 is safe because it matches the isolation of the conformance.
-Calling `Dancer.perform` in generic code and on an `any Dancer` type
-from a concurrent task results in an error,
-because it would allow calling the main actor isolated implementation
-of `Dancer.perform` from outside the main actor.
+But doing the same thing from a concurrent task results in an error,
+because it would allow calling the main-actor-isolated implementation
+of `Dancer.perform()` from outside the main actor.
 
-Abstract code that uses type parameters and `any` types
-can check whether a value conforms to a protocol
+The compiler can enforce the isolation in this example
+because it knows that the `ballerina` variable is an instance
+of the `@MainActor`-isolated `Ballerina` type.
+When you instead have code that uses type parameters and `any` types,
+you can check whether a value conforms to a protocol
 through dynamic casting.
-The following code has a protocol `Dancer`,
-and a method `performIfDancer` that accepts a parameter of type `Any`
-which is dynamically cast to `any Dancer` in the function body:
+
+The following example uses the same protocol from before, `Dancer`,
+which defines a `perform()` method and doesn't declare any actor isolation.
+It then defines a `performIfDancer`function
+that accepts a parameter of type `Any`
+and attempts to cast it to the `Dancer` type.
 
 ```swift
-protocol Dancer {
-    func perform()
-}
-
 func performIfDancer(_ value: Any) {
     if let dancer = value as? any Dancer {
         dancer.perform()
@@ -1757,11 +1790,12 @@ func performIfDancer(_ value: Any) {
 
 Isolated conformances are only safe to use
 when the code is running on the global actor
-that the conformance is isolated to,
-so the dynamic cast only succeeds
+that the conformance is isolated to.
+So in this example, the dynamic cast only succeeds
 if the dynamic cast occurs on that global actor.
-For example, if you declare a main-actor isolated conformance to `Dancer`
-and call `performIfDancer` with an instance of the conforming type,
+For example, if you again declare `Ballerina`
+as a main-actor isolated conformance to `Dancer`
+and call `performIfDancer()` with an instance of the conforming type,
 the dynamic cast will succeed
 when `performIfDancer` is called in a main actor task, and it
 will fail when `performIfDancer` is called in a concurrent
@@ -1780,20 +1814,20 @@ Task { @MainActor in
 }
 
 Task { @concurrent in
-    let ballerina = Ballerina()
+    let ballerina = await Ballerina()
     performIfDancer(ballerina)  // Prints nothing
 }
 ```
 
 In the above code,
-the call to `performIfDancer` from a main-actor isolated task
+the call to `performIfDancer()` from a main-actor isolated task
 matches the isolation of the conformance,
 so the dynamic cast succeeds.
-The call to `performIfDancer` from a concurrent task
+The call to `performIfDancer()` from a concurrent task
 happens outside the main actor,
 so the dynamic cast fails and `perform` is not called.
 
-#### Restricting Isolated Conformances in Concurrent Code
+### Restricting Isolated Conformances in Concurrent Code
 
 Protocol requirements can be used
 through instances of conforming types and through
@@ -1809,7 +1843,16 @@ parameter that requires a conformance
 to `Sendable` or `SendableMetatype`.
 
 A conformance requirement to `Sendable` indicates
-that instances may be passed across isolation boundaries and used concurrently:
+that instances may be passed across isolation boundaries and used concurrently.
+On the other hand, 
+if generic code accepts non-`Sendable` types,
+then the generic code can only use the input values
+from the current isolation domain.
+These generic APIs can safely accept isolated conformances
+and call protocol requirements
+as long as the caller is on the same global actor
+that the conformance is isolated to.
+The follow example introduces a generic call that uses the `Dancer` type:
 
 ```swift
 protocol Dancer {
@@ -1825,7 +1868,7 @@ func performConcurrently<D: Dancer>(_ dancer: D) where D: Sendable {
 
 The above code would admit data races
 if the conformance to `Dancer` was isolated,
-because the implementation of `perform`
+because the implementation of `perform()`
 may access global actor isolated state.
 To prevent data races,
 Swift prohibits using an isolated conformance
@@ -1844,10 +1887,10 @@ which can't satisfy the `Sendable` requirement of `performConcurrently`.
 
 Static and initializer protocol requirements
 can also be called through metatype values.
-A conformance to Sendable on the metatype type,
+A conformance to `Sendable` on the metatype type,
 such as `Int.Type`,
 indicates that a metatype value is safe
-to pass across isolation boundaries and used concurrently.
+to pass across isolation boundaries and use concurrently.
 Metatype types can conform to `Sendable`
 even when the type does not conform to `Sendable`;
 this means that only metatype values are safe to share in concurrent code,
@@ -1864,11 +1907,11 @@ protocol Dancer {
     func perform()
 }
 
-func performConcurrently<D: Dancer>(n: Int, for: D.Type) async where T: SendableMetatype {
+func performConcurrently<D: Dancer>(n: Int, for: D.Type) async where D: SendableMetatype {
     await withDiscardingTaskGroup { group in
         for _ in 0..<n {
             group.addTask {
-                let dancer = T.init()
+                let dancer = D.init()
                 dancer.perform()
             }
         }
@@ -1900,10 +1943,6 @@ func performConcurrently<D: Dancer>(n: Int, for: D.Type) async {
 }
 ```
 
-Note that `Sendable` requires `SendableMetatype`,
-so an explicit conformance to `SendableMetatype` is only necessary
-if the type is non-`Sendable`.
-
 Types with isolated conformances can't satisfy
 a `SendableMetatype` generic requirement.
 Swift will prevent calling `createParallel`
@@ -1915,12 +1954,10 @@ with a type that has an isolated conformance to `Dancer`:
     func perform() { /* use main actor state */ }
 }
 
-let items = performConcurrently(n: 10, for: Ballerina.self)  // Error
+let items = await performConcurrently(n: 10, for: Ballerina.self)  // Error
 ```
 
-##### Protocols That Require `Sendable` or `SendableMetatype`
-
-<!-- XXX: Can't use code voice in headings -->
+### Protocols That Require Sendable or SendableMetatype
 
 Protocols can directly require that
 conforming types also conform to `Sendable` or `SendableMetatype`:
@@ -1933,9 +1970,11 @@ public protocol ModelFactory: SendableMetatype {
 }
 ```
 
-Note that the `Sendable` protocol requires `SendableMetatype`;
+Since the `Sendable` protocol requires `SendableMetatype`,
 if an instance of a conforming type is safe to share across concurrent code,
-its metatype must also be safe to share:
+its metatype must also be safe to share.
+This is expressed in Swift's declaration of `Sendable`, which is an extension
+of `SendableMetatype`:
 
 ```swift
 public protocol Sendable: SendableMetatype {}
@@ -1954,6 +1993,10 @@ because generic code can always call requirements concurrently.
 @MainActor
 enum MyError: @MainActor Error {}  // Error
 ```
+
+This delcaration results in the error
+"Cannot form main actor-isolated conformance of 'MyError'
+to SendableMetatype-inheriting protocol 'Error'".
 
 <!--
   LEFTOVER OUTLINE BITS
