@@ -1935,7 +1935,6 @@ func performConcurrently<D: Dancer>(n: Int, for: D.Type) async {
     await withDiscardingTaskGroup { group in
         for _ in 0..<n {
             group.addTask {
-                // TODO: This doesn't actually error for me. -@invalidname
                 let dancer = D.init() // Error
                 dancer.perform()
             }
@@ -1955,7 +1954,6 @@ with a type that has an isolated conformance to `Dancer`:
     func perform() { /* use main actor state */ }
 }
 
-// TODO: This doesn't actually error for me. -@invalidname
 let items = await performConcurrently(n: 10, for: Ballerina.self)  // Error
 ```
 
